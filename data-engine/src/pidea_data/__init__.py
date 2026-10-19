@@ -1,0 +1,2 @@
+"""PIDEA data engine: extract, validate, transform, load."""
+__version__ = "0.1.0"

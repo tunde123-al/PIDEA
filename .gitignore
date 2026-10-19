@@ -1,0 +1,21 @@
+# secrets / local config
+.env
+*.pem
+*.key
+*.tfstate*
+.terraform/
+# build outputs
+backend/target/
+**/__pycache__/
+*.pyc
+*.log
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+# local data / tools
+local-data/
+.qodo/
+.idea/
+.vscode/
+local-demo-credentials.txt

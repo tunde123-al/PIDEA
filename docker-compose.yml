@@ -1,0 +1,66 @@
+# Local stack:  docker compose up -d --build
+# Requires a .env file (copy .env.example). No AWS credentials needed.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pidea}
+      POSTGRES_USER: ${POSTGRES_USER:-pidea_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PIDEA_DB_PASSWORD: ${PIDEA_DB_PASSWORD:?set PIDEA_DB_PASSWORD in .env}
+      PIDEA_WORKER_DB_PASSWORD: ${PIDEA_WORKER_DB_PASSWORD:?set PIDEA_WORKER_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${PIDEA_DB_PORT:-5432}:5432"      # localhost only
+    volumes:
+      - pidea-db:/var/lib/postgresql/data
+      - ./docker/db-init.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    healthcheck:                   # "container running" != "database ready"
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./backend
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      PIDEA_DB_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-pidea}
+      PIDEA_DB_USER: pidea_app
+      PIDEA_DB_PASSWORD: ${PIDEA_DB_PASSWORD}
+      PIDEA_FLYWAY_USER: ${POSTGRES_USER:-pidea_owner}
+      PIDEA_FLYWAY_PASSWORD: ${POSTGRES_PASSWORD}
+      PIDEA_ADMIN_PASSWORD_HASH: ${PIDEA_ADMIN_PASSWORD_HASH:-}
+      PIDEA_OPERATOR_PASSWORD_HASH: ${PIDEA_OPERATOR_PASSWORD_HASH:-}
+      PIDEA_VIEWER_PASSWORD_HASH: ${PIDEA_VIEWER_PASSWORD_HASH:-}
+      PIDEA_UPLOAD_DIR: /var/lib/pidea/uploads
+      JAVA_TOOL_OPTIONS: -Xmx384m
+    ports:
+      - "127.0.0.1:${PIDEA_API_PORT:-8080}:8080"
+    volumes:
+      - pidea-uploads:/var/lib/pidea/uploads
+    mem_limit: 640m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    stop_grace_period: 30s
+
+  worker:
+    build: ./data-engine
+    depends_on:
+      api: { condition: service_healthy }   # the API applies the Flyway migrations first
+    environment:
+      PIDEA_DB_DSN: postgresql://pidea_worker:${PIDEA_WORKER_DB_PASSWORD}@db:5432/${POSTGRES_DB:-pidea}
+      PIDEA_DATA_DIR: /uploads
+      PIDEA_HTTP_API_ALLOWED_HOSTS: ${PIDEA_HTTP_API_ALLOWED_HOSTS:-}
+      PIDEA_HTTP_API_BEARER_TOKEN: ${PIDEA_HTTP_API_BEARER_TOKEN:-}
+    volumes:
+      - pidea-uploads:/uploads
+    mem_limit: 256m
+
+volumes:
+  pidea-db:
+  pidea-uploads:
