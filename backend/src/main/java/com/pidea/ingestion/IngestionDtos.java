@@ -33,6 +33,13 @@ public final class IngestionDtos {
     public record RejectedRecordResponse(UUID id, String sourceRecordRef, String reasonCode, String details,
                                          Instant processedAt) {}
 
+    /** A quarantined record across jobs. Reason code and safe diagnostics only; the raw payload is never stored here. */
+    public record QuarantinedRecordResponse(UUID id, UUID jobId, UUID sourceId, String entityType,
+                                            String sourceRecordRef, String reasonCode, String details,
+                                            Instant processedAt) {}
+
+    public record ReasonCount(String reasonCode, long count) {}
+
     public record JobAttemptResponse(int attemptNo, String outcome, String error,
                                      Instant startedAt, Instant finishedAt) {}
 }

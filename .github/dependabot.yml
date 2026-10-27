@@ -1,0 +1,25 @@
+# Weekly update PRs. Each PR runs the full CI (unit, integration, e2e) before merge; review changelogs, don't auto-merge.
+# Actions and Docker images are pinned by digest/SHA; Dependabot rewrites the pin and the trailing version comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: maven
+    directory: /backend
+    schedule: { interval: weekly }
+  - package-ecosystem: pip
+    directory: /data-engine
+    schedule: { interval: weekly }
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /backend
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /data-engine
+    schedule: { interval: weekly }
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule: { interval: weekly }

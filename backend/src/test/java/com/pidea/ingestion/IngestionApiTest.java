@@ -263,6 +263,23 @@ class IngestionApiTest extends AbstractPostgresTest {
             .andExpect(status().isForbidden());
     }
 
+
+    @Test
+    void replayIsRefusedWhenTheOriginalInputWasPurgedByRetention() throws Exception {
+        UUID failedId = UUID.randomUUID();
+        jdbc.update("""
+            INSERT INTO integration.ingestion_job
+              (id, source_id, job_type, entity_type, status, correlation_id, records_received,
+               next_attempt_at, submitted_at, completed_at, submitted_by)
+            VALUES (?, ?, 'RECORDS', 'CUSTOMER', 'FAILED', 'purged-test', 2, now(), now(), now(), 'operator')""",
+            failedId, sourceId);   // no raw_record rows: exactly what the worker's retention purge leaves behind
+
+        mvc.perform(post("/api/v1/ingestion/jobs/" + failedId + "/replay").with(OPERATOR))
+            .andExpect(status().isConflict())
+            .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("no longer retained")));
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM integration.ingestion_job WHERE replay_of = ?",
+            Integer.class, failedId)).isZero();   // no half-built replay job was left behind
+    }
     @Test
     void failedJobReplayIsSafeAndRepeatableWithoutDuplicatingInput() throws Exception {
         UUID failedId = UUID.randomUUID();
@@ -332,6 +349,140 @@ class IngestionApiTest extends AbstractPostgresTest {
         assertThat(jdbc.queryForObject(
             "SELECT count(*) FROM integration.ingestion_job WHERE source_id=?",
             Integer.class, httpSource)).isEqualTo(1);
+    }
+
+    @Test
+    void postgresPullCreatesAPostgresPullJobAndFailedPullsCanBeReplayed() throws Exception {
+        UUID pgSource = UUID.randomUUID();
+        jdbc.update("""
+            INSERT INTO integration.integration_source
+              (id, name, source_type, status, config, secret_ref, created_at, updated_at)
+            VALUES (?, ?, 'POSTGRES_TABLE', 'ACTIVE',
+                    '{"host":"crm-db.internal","database":"crm","user":"r","schema":"public","table":"customers","keyColumn":"id"}'::jsonb,
+                    'PIDEA_SRC_CRM_PASSWORD', now(), now())""", pgSource, "pg-" + pgSource);
+        String key = "pg-pull-" + UUID.randomUUID();
+        String body = mvc.perform(post("/api/v1/ingestion/sources/" + pgSource + "/jobs")
+                .param("entityType", "CUSTOMER").header("Idempotency-Key", key).with(OPERATOR))
+            .andExpect(status().isAccepted())
+            .andExpect(jsonPath("$.jobType").value("POSTGRES_PULL"))
+            .andExpect(jsonPath("$.status").value("PENDING"))
+            .andReturn().getResponse().getContentAsString();
+        String id = json.readTree(body).get("id").asText();
+        mvc.perform(post("/api/v1/ingestion/sources/" + pgSource + "/jobs")
+                .param("entityType", "CUSTOMER").header("Idempotency-Key", key).with(OPERATOR))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(id));
+        mvc.perform(post("/api/v1/ingestion/sources/" + pgSource + "/jobs")
+                .param("entityType", "CUSTOMER").header("Idempotency-Key", "pg-viewer").with(VIEWER))
+            .andExpect(status().isForbidden());
+
+        jdbc.update("UPDATE integration.ingestion_job SET status='FAILED', completed_at=now() WHERE id=?::uuid", id);
+        mvc.perform(post("/api/v1/ingestion/jobs/" + id + "/replay").with(OPERATOR))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.jobType").value("POSTGRES_PULL"))
+            .andExpect(jsonPath("$.replayOf").value(id));
+    }
+
+    @Test
+    void sourcesWithoutAPullPathCannotBeTriggered() throws Exception {
+        UUID csvSource = createFileSource(SourceType.CSV_FILE);
+        mvc.perform(post("/api/v1/ingestion/sources/" + csvSource + "/jobs")
+                .param("entityType", "CUSTOMER").header("Idempotency-Key", "no-pull-" + csvSource).with(OPERATOR))
+            .andExpect(status().isConflict());
+    }
+
+    private UUID quarantineJob(UUID source, String entity) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("""
+            INSERT INTO integration.ingestion_job (id, source_id, job_type, entity_type, status, correlation_id,
+              records_received, records_accepted, records_rejected, next_attempt_at, submitted_at, submitted_by)
+            VALUES (?, ?, 'RECORDS', ?, 'PARTIALLY_SUCCEEDED', 'q-test', 3, 1, 2, now(), now(), 'test')""",
+            id, source, entity);
+        return id;
+    }
+
+    private void rejected(UUID job, UUID source, String entity, String ref, String reason, String minutesAgo) {
+        jdbc.update("""
+            INSERT INTO integration.rejected_record
+              (id, job_id, source_id, entity_type, source_record_ref, reason_code, details, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'safe detail', now() - ?::interval)""",
+            UUID.randomUUID(), job, source, entity, ref, reason, minutesAgo + " minutes");
+    }
+
+    @Test
+    void quarantineListingFiltersPagesAndNeverReturnsPayloads() throws Exception {
+        String tag = "Q" + UUID.randomUUID().toString().replace("-", "").substring(0, 8).toUpperCase();
+        UUID other = createFileSource(SourceType.CSV_FILE);
+        UUID jobA = quarantineJob(sourceId, "CUSTOMER");
+        UUID jobB = quarantineJob(other, "ORDER");
+        rejected(jobA, sourceId, "CUSTOMER", "seq 1", tag + "_EMAIL", "30");
+        rejected(jobA, sourceId, "CUSTOMER", "seq 2", tag + "_DATE", "20");
+        rejected(jobB, other, "ORDER", "row 7", tag + "_EMAIL", "10");
+
+        // newest first, across jobs and sources
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("reasonCode", tag + "_EMAIL").with(OPERATOR))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.totalItems").value(2))
+            .andExpect(jsonPath("$.items[0].sourceRecordRef").value("row 7"))
+            .andExpect(jsonPath("$.items[1].sourceRecordRef").value("seq 1"))
+            .andExpect(jsonPath("$.items[0].jobId").value(jobB.toString()))
+            .andExpect(jsonPath("$.items[0].entityType").value("ORDER"))
+            .andExpect(jsonPath("$.items[0].payload").doesNotExist())
+            .andExpect(jsonPath("$.items[0].rawPayload").doesNotExist());
+        // each filter on its own
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("sourceId", sourceId.toString()).with(ADMIN))
+            .andExpect(jsonPath("$.items[*].sourceId", org.hamcrest.Matchers.everyItem(
+                org.hamcrest.Matchers.is(sourceId.toString()))));
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("jobId", jobA.toString()).with(OPERATOR))
+            .andExpect(jsonPath("$.totalItems").value(2));
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("jobId", jobA.toString())
+                .param("entityType", "ORDER").with(OPERATOR))
+            .andExpect(jsonPath("$.totalItems").value(0));
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("reasonCode", tag + "_DATE")
+                .param("processedFrom", java.time.Instant.now().minusSeconds(25 * 60).toString()).with(OPERATOR))
+            .andExpect(jsonPath("$.totalItems").value(1));
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("reasonCode", tag + "_DATE")
+                .param("processedTo", java.time.Instant.now().minusSeconds(25 * 60).toString()).with(OPERATOR))
+            .andExpect(jsonPath("$.totalItems").value(0));
+        // paging
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("jobId", jobA.toString())
+                .param("size", "1").param("page", "1").with(OPERATOR))
+            .andExpect(jsonPath("$.items.length()").value(1))
+            .andExpect(jsonPath("$.totalPages").value(2))
+            .andExpect(jsonPath("$.items[0].sourceRecordRef").value("seq 1"));
+        // the page size can never be unbounded
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("size", "100000").with(OPERATOR))
+            .andExpect(jsonPath("$.size").value(100));
+    }
+
+    @Test
+    void quarantineReasonsSummariseWhatIsStored() throws Exception {
+        String tag = "R" + UUID.randomUUID().toString().replace("-", "").substring(0, 8).toUpperCase();
+        UUID job = quarantineJob(sourceId, "CUSTOMER");
+        rejected(job, sourceId, "CUSTOMER", "seq 1", tag + "_A", "5");
+        rejected(job, sourceId, "CUSTOMER", "seq 2", tag + "_A", "4");
+        rejected(job, sourceId, "CUSTOMER", "seq 3", tag + "_B", "3");
+        mvc.perform(get("/api/v1/ingestion/rejected-records/reasons").param("sourceId", sourceId.toString())
+                .with(OPERATOR))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$[?(@.reasonCode=='" + tag + "_A')].count").value(2))
+            .andExpect(jsonPath("$[?(@.reasonCode=='" + tag + "_B')].count").value(1));
+    }
+
+    @Test
+    void quarantineAccessIsEnforcedOnTheServerAndInputIsValidated() throws Exception {
+        mvc.perform(get("/api/v1/ingestion/rejected-records")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/v1/ingestion/rejected-records").with(VIEWER)).andExpect(status().isForbidden());
+        mvc.perform(get("/api/v1/ingestion/rejected-records/reasons").with(VIEWER)).andExpect(status().isForbidden());
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("reasonCode", "lower; DROP TABLE x").with(OPERATOR))
+            .andExpect(status().isBadRequest());
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("entityType", "NOPE").with(OPERATOR))
+            .andExpect(status().isBadRequest());
+        mvc.perform(get("/api/v1/ingestion/rejected-records").param("sourceId", "not-a-uuid").with(OPERATOR))
+            .andExpect(status().isBadRequest());
+        mvc.perform(get("/api/v1/ingestion/rejected-records")
+                .param("processedFrom", "2050-01-01T00:00:00Z").param("processedTo", "2040-01-01T00:00:00Z")
+                .with(OPERATOR))
+            .andExpect(status().isBadRequest());
     }
 
     private UUID createFileSource(SourceType type) {

@@ -46,6 +46,8 @@ public class SecurityConfig {
             .authorizeHttpRequests(a -> a
                 .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()
                 .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
+                // metrics/info describe the platform internals: read-only operators and admins only
+                .requestMatchers("/actuator/**").hasAnyRole("ADMIN", "VIEWER")
                 .anyRequest().authenticated())
             .httpBasic(Customizer.withDefaults());
         return http.build();

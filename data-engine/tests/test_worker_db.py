@@ -8,7 +8,7 @@ from threading import Event, Thread
 import psycopg
 import pytest
 
-from pidea_data import rest_adapter, worker
+from pidea_data import connectors, rest_adapter, worker
 from pidea_data.worker import backoff_delay, process_one, recover_stale, utcnow
 
 
@@ -153,7 +153,7 @@ def test_http_pull_uses_existing_transform_and_upsert_path(conn, make_job, monke
         calls.append((config, secret_ref))
         return [("page 1 record 0", customer(77))]
 
-    monkeypatch.setattr(worker, "read_records", mock_read)
+    monkeypatch.setattr(connectors, "read_records", mock_read)
     assert process_one(conn) == "SUCCEEDED"
     assert calls[0][0]["baseUrl"] == "https://api.example.test/customers"
     assert calls[0][1] == "PIDEA_HTTP_API_BEARER_TOKEN"
@@ -171,7 +171,7 @@ def test_http_pull_transient_failures_use_job_retry_policy(conn, make_job, monke
     def unavailable(*args, **kwargs):
         raise rest_adapter.TransientSourceError("HTTP_API request timed out")
 
-    monkeypatch.setattr(worker, "read_records", unavailable)
+    monkeypatch.setattr(connectors, "read_records", unavailable)
     assert process_one(conn, rand=lambda: 0.5) == "RETRY_SCHEDULED"
     assert job_row(conn, jid)[5] == 1
     assert job_row(conn, jid)[6] == "HTTP_API request timed out"

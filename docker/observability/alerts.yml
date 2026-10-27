@@ -1,0 +1,30 @@
+# Shown on the Prometheus "Alerts" page. No Alertmanager is bundled, so nothing is sent anywhere; wire one up (or
+# copy these rules into your own monitoring) for real notifications.
+groups:
+  - name: pidea
+    rules:
+      - alert: PideaNoWorkerAlive
+        expr: pidea_workers_alive == 0 and pidea_queue_depth > 0
+        for: 2m
+        annotations:
+          summary: Jobs are waiting but no worker has sent a heartbeat in the last 60 seconds.
+      - alert: PideaQueueStuck
+        expr: pidea_queue_oldest_age_seconds > 600
+        for: 5m
+        annotations:
+          summary: The longest-waiting runnable job has been waiting more than 10 minutes.
+      - alert: PideaStaleRunningJobs
+        expr: pidea_jobs_stale_running > 0
+        for: 1m
+        annotations:
+          summary: Jobs have been RUNNING longer than the worker stale-claim timeout (a worker died mid-job).
+      - alert: PideaMetricsSnapshotStale
+        expr: pidea_metrics_snapshot_age_seconds > 120
+        for: 2m
+        annotations:
+          summary: The API cannot refresh workload metrics from the database; the values on the dashboard are stale.
+      - alert: PideaApiDown
+        expr: up{job="pidea-api"} == 0
+        for: 1m
+        annotations:
+          summary: Prometheus cannot scrape the API.

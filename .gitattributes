@@ -1,0 +1,7 @@
+# Files that run inside Linux containers or under bash must keep LF line endings even when a Windows checkout
+# uses core.autocrlf=true; CRLF breaks them ("bash\r: not found", "env: bash\r").
+*.sh              text eol=lf
+Dockerfile        text eol=lf
+backend/mvnw      text eol=lf
+docker/**         text eol=lf
+*.cmd             text eol=crlf

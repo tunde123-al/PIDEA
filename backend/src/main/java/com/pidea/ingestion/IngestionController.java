@@ -125,6 +125,29 @@ public class IngestionController {
         return service.rejected(id, page, size);
     }
 
+    @GetMapping("/rejected-records")
+    @PreAuthorize("hasAnyRole('ADMIN','OPERATOR')")
+    @Operation(summary = "Quarantined records across jobs (ADMIN, OPERATOR; not VIEWER)",
+        description = "Newest first, filterable by source, job, entity type, reason code and time. Returns reason "
+            + "codes and safe diagnostics only, never the raw source payload. Page size is capped at 100.")
+    public PageResponse<QuarantinedRecordResponse> quarantine(@RequestParam(required = false) UUID sourceId,
+                                                              @RequestParam(required = false) UUID jobId,
+                                                              @RequestParam(required = false) EntityType entityType,
+                                                              @RequestParam(required = false) String reasonCode,
+                                                              @RequestParam(required = false) Instant processedFrom,
+                                                              @RequestParam(required = false) Instant processedTo,
+                                                              @RequestParam(defaultValue = "0") int page,
+                                                              @RequestParam(defaultValue = "50") int size) {
+        return service.quarantine(sourceId, jobId, entityType, reasonCode, processedFrom, processedTo, page, size);
+    }
+
+    @GetMapping("/rejected-records/reasons")
+    @PreAuthorize("hasAnyRole('ADMIN','OPERATOR')")
+    @Operation(summary = "Distinct quarantine reason codes with counts (ADMIN, OPERATOR; not VIEWER)")
+    public java.util.List<ReasonCount> quarantineReasons(@RequestParam(required = false) UUID sourceId) {
+        return service.quarantineReasons(sourceId);
+    }
+
     @GetMapping("/jobs/{id}/attempts")
     @PreAuthorize("hasAnyRole('ADMIN','OPERATOR','VIEWER')")
     public PageResponse<JobAttemptResponse> attempts(@PathVariable UUID id,

@@ -6,6 +6,7 @@ import static org.hamcrest.Matchers.not;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -107,6 +108,49 @@ class IntegrationSourceApiTest extends AbstractPostgresTest {
             .andExpect(status().isBadRequest());
     }
 
+
+    private static final String PG_CONFIG = """
+        {"host":"crm-db.internal","port":5432,"database":"crm","user":"pidea_reader","sslmode":"verify-full",
+         "schema":"public","table":"customers","keyColumn":"id","columns":"customer_id, full_name, email",
+         "batchSize":500,"maxRows":10000,"timeoutSeconds":30}""";
+
+    private org.springframework.test.web.servlet.ResultActions createPostgresSource(String name, String config, String secretRef)
+            throws Exception {
+        String ref = secretRef == null ? "" : ",\"secretRef\":\"" + secretRef + "\"";
+        return mvc.perform(post("/api/v1/integration-sources").contentType(MediaType.APPLICATION_JSON)
+            .content("{\"name\":\"" + name + "\",\"type\":\"POSTGRES_TABLE\",\"config\":" + config + ref + "}"));
+    }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void postgresTableSourceAcceptsSafeConfigAndKeepsOnlyTheSecretName() throws Exception {
+        createPostgresSource("pg-customers", PG_CONFIG, "PIDEA_SRC_CRM_PASSWORD")
+            .andExpect(status().isCreated())
+            .andExpect(jsonPath("$.type").value("POSTGRES_TABLE"))
+            .andExpect(jsonPath("$.secretConfigured").value(true))
+            .andExpect(jsonPath("$.config.table").value("customers"))
+            .andExpect(content().string(not(containsString("PIDEA_SRC_CRM_PASSWORD"))));
+    }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void postgresTableSourceRejectsUnsafeOrIncompleteConfig() throws Exception {
+        String[] bad = {
+            PG_CONFIG.replace("\"customers\"", "\"customers; DROP TABLE x\""),            // SQL in an identifier
+            PG_CONFIG.replace("\"id\"", "\"id) --\""),
+            PG_CONFIG.replace("full_name, email", "full_name, email) FROM t; --"),
+            PG_CONFIG.replace("crm-db.internal", "crm db"),
+            PG_CONFIG.replace("verify-full", "whatever"),
+            PG_CONFIG.replace("\"maxRows\":10000", "\"maxRows\":1000000"),
+            PG_CONFIG.replace("\"keyColumn\":\"id\",", ""),                                // keyColumn is required
+            PG_CONFIG.replace("{\"host\"", "{\"password\":\"hunter2\",\"host\""),          // credential-looking key
+            PG_CONFIG.replace("{\"host\"", "{\"unexpected\":\"x\",\"host\""),
+        };
+        for (int i = 0; i < bad.length; i++) {
+            createPostgresSource("pg-bad-" + i, bad[i], "PIDEA_SRC_CRM_PASSWORD").andExpect(status().isBadRequest());
+        }
+        createPostgresSource("pg-bad-ref", PG_CONFIG, "crm_password").andExpect(status().isBadRequest());
+    }
     @Test
     @WithMockUser(roles = "ADMIN")
     void duplicateNameIsConflict() throws Exception {

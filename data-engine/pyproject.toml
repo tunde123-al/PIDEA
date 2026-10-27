@@ -21,6 +21,7 @@ dev = [
     "responses>=0.25",
     "testcontainers[postgres]>=4.8",
     "bcrypt>=4.1,<6",
+    "trustme>=1.1",
 ]
 
 [tool.setuptools.packages.find]

@@ -20,6 +20,11 @@ public class SourceConfigValidator {
     private static final int MAX_VALUE_LENGTH = 500;
     private static final Set<String> HTTP_API_KEYS =
         Set.of("baseUrl", "pageParam", "pageSizeParam", "pageSize", "maxPages", "timeoutSeconds");
+    private static final Set<String> POSTGRES_TABLE_KEYS = Set.of("host", "port", "database", "user", "sslmode",
+        "schema", "table", "keyColumn", "columns", "batchSize", "maxRows", "timeoutSeconds");
+    private static final Pattern SQL_IDENTIFIER = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]{0,62}$");
+    private static final Pattern HOST = Pattern.compile("^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$");
+    private static final Set<String> SSL_MODES = Set.of("disable", "prefer", "require", "verify-ca", "verify-full");
 
     public Map<String, Object> validate(SourceType type, Map<String, Object> config) {
         Map<String, Object> clean = new LinkedHashMap<>();
@@ -59,7 +64,54 @@ public class SourceConfigValidator {
                 throw new ValidationException("pageParam and pageSizeParam must be different");
             }
         }
+        if (type == SourceType.POSTGRES_TABLE) {
+            validatePostgresTable(clean);
+        }
         return clean;
+    }
+
+    /**
+     * Syntactic checks for a POSTGRES_TABLE source. Identifiers are restricted to plain names because the worker
+     * quotes them as identifiers (never as SQL text); the worker re-validates everything and additionally enforces
+     * the host allow-list, a read-only session and that keyColumn is a unique NOT NULL column.
+     */
+    private static void validatePostgresTable(Map<String, Object> config) {
+        if (!POSTGRES_TABLE_KEYS.containsAll(config.keySet())) {
+            throw new ValidationException("POSTGRES_TABLE config supports only: " + String.join(", ",
+                new java.util.TreeSet<>(POSTGRES_TABLE_KEYS)));
+        }
+        for (String required : new String[] {"host", "database", "user", "schema", "table", "keyColumn"}) {
+            if (!(config.get(required) instanceof String s) || s.isBlank()) {
+                throw new ValidationException("POSTGRES_TABLE sources require a '" + required + "' config entry");
+            }
+        }
+        if (!HOST.matcher((String) config.get("host")).matches()) {
+            throw new ValidationException("host must be a plain hostname or IP address");
+        }
+        for (String key : new String[] {"database", "user", "schema", "table", "keyColumn"}) {
+            if (!SQL_IDENTIFIER.matcher((String) config.get(key)).matches()) {
+                throw new ValidationException(key + " must be a plain identifier (letters, digits, underscore)");
+            }
+        }
+        if (config.get("columns") != null) {
+            if (!(config.get("columns") instanceof String list)) {
+                throw new ValidationException("columns must be a comma-separated list of column names");
+            }
+            String[] columns = list.split(",", -1);
+            if (columns.length > 50) throw new ValidationException("columns may list at most 50 columns");
+            for (String column : columns) {
+                if (!SQL_IDENTIFIER.matcher(column.trim()).matches()) {
+                    throw new ValidationException("columns must be plain identifiers separated by commas");
+                }
+            }
+        }
+        if (config.get("sslmode") != null && !SSL_MODES.contains(String.valueOf(config.get("sslmode")))) {
+            throw new ValidationException("sslmode must be one of " + new java.util.TreeSet<>(SSL_MODES));
+        }
+        validateInteger(config, "port", 1, 65535);
+        validateInteger(config, "batchSize", 1, 5000);
+        validateInteger(config, "maxRows", 1, 100000);
+        validateInteger(config, "timeoutSeconds", 1, 120);
     }
 
     private static void validateInteger(Map<String, Object> config, String key, int min, int max) {

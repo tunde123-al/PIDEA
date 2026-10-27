@@ -13,8 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
+import signal
+import socket
+import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,8 +30,9 @@ from pathlib import Path
 import psycopg
 
 from . import extractors
+from .connectors import CONNECTORS, Checkpoint, PullBatch, PullConnector
 from .loaders import load_valid, record_rejects
-from .rest_adapter import PermanentSourceError, TransientSourceError, read_records
+from .rest_adapter import PermanentSourceError, TransientSourceError
 from .transform import MappingError, transform
 
 log = logging.getLogger("pidea.worker")
@@ -113,22 +119,54 @@ def _extract(conn: psycopg.Connection, job: Job, data_dir: Path | None):
             return list(reader(path))
         except extractors.ExtractionError as e:
             raise PermanentJobError(str(e)) from None
-    if job.job_type == "HTTP_PULL":
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT status, source_type, config::text, secret_ref FROM integration.integration_source WHERE id=%s",
-                (job.source_id,),
-            )
-            source = cur.fetchone()
-        if source is None or source[0] != "ACTIVE" or source[1] != "HTTP_API":
-            raise PermanentJobError("HTTP_API source is unavailable or disabled")
-        try:
-            return read_records(json.loads(source[2]), source[3])
-        except TransientSourceError as e:
-            raise TransientJobError(str(e)) from None
-        except PermanentSourceError as e:
-            raise PermanentJobError(str(e)) from None
     raise PermanentJobError(f"unsupported job type {job.job_type}")
+
+
+def _extract_pull(conn: psycopg.Connection, job: Job, connector: PullConnector) -> PullBatch:
+    """Run a pull connector for this job. Source checks, checkpoint locking and error mapping live here once.
+
+    The checkpoint row (for connectors that use one) is locked FOR UPDATE until the job's transaction ends, so
+    concurrent pulls of one source/entity are serialised and the checkpoint cannot move backwards. It is only
+    advanced by ``_advance_checkpoint`` in the same transaction as the load, never here.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, source_type, config::text, secret_ref FROM integration.integration_source WHERE id=%s",
+            (job.source_id,),
+        )
+        source = cur.fetchone()
+        if source is None or source[0] != "ACTIVE" or source[1] != connector.source_type:
+            raise PermanentJobError(f"{connector.source_type} source is unavailable or disabled")
+        checkpoint = Checkpoint()
+        if connector.uses_checkpoint:
+            cur.execute(
+                """INSERT INTO integration.source_checkpoint (source_id, entity_type, updated_at) VALUES (%s,%s,now())
+                   ON CONFLICT (source_id, entity_type) DO NOTHING""",
+                (job.source_id, job.entity_type),
+            )
+            cur.execute(
+                """SELECT cursor_key, cursor_value FROM integration.source_checkpoint
+                   WHERE source_id=%s AND entity_type=%s FOR UPDATE""",
+                (job.source_id, job.entity_type),
+            )
+            checkpoint = Checkpoint(*cur.fetchone())
+    try:
+        return connector.pull(json.loads(source[2]), source[3], checkpoint)
+    except TransientSourceError as e:
+        raise TransientJobError(str(e)) from None
+    except PermanentSourceError as e:
+        raise PermanentJobError(str(e)) from None
+
+
+def _advance_checkpoint(cur: psycopg.Cursor, job: Job, batch: PullBatch, now: datetime) -> None:
+    new = batch.checkpoint
+    if new is None or new.value is None:  # nothing read: keep the stored checkpoint
+        return
+    cur.execute(
+        """UPDATE integration.source_checkpoint SET cursor_key=%s, cursor_value=%s, last_job_id=%s, updated_at=%s
+           WHERE source_id=%s AND entity_type=%s""",
+        (new.key, new.value, job.id, now, job.source_id, job.entity_type),
+    )
 
 
 def _cleanup_uploaded_file(job: Job, data_dir: Path | None) -> None:
@@ -222,7 +260,13 @@ def run_job(conn: psycopg.Connection, job: Job, data_dir: Path | None, now_fn: C
             claim = cur.fetchone()
         if claim is None or claim[0] != "RUNNING" or claim[1] != job.retry_count:
             raise JobClaimLost(f"worker no longer owns job {job.id}")
-        records = _extract(conn, job, data_dir)
+        batch: PullBatch | None = None
+        connector = CONNECTORS.get(job.job_type)
+        if connector is not None:
+            batch = _extract_pull(conn, job, connector)
+            records = batch.records
+        else:
+            records = _extract(conn, job, data_dir)
         mapping, mapping_version = _latest_mapping(conn, job)
         try:
             result = transform(job.entity_type, records, mapping)
@@ -241,6 +285,8 @@ def run_job(conn: psycopg.Connection, job: Job, data_dir: Path | None, now_fn: C
                 status, summary = "PARTIALLY_SUCCEEDED", f"{rejected} of {result.received} records rejected"
             else:
                 status, summary = "FAILED", "all records were rejected"
+            if batch is not None and status != "FAILED":
+                _advance_checkpoint(cur, job, batch, now)  # same transaction as the load: all or nothing
             cur.execute(
                 """UPDATE integration.ingestion_job SET status=%s, completed_at=%s, records_received=%s,
                           records_accepted=%s, records_rejected=%s, records_duplicate=%s, error_summary=%s,
@@ -291,27 +337,39 @@ def process_one(conn: psycopg.Connection, data_dir: Path | None = None,
     job = claim_next(conn, now_fn())
     if job is None:
         return None
-    log.info("job claimed", extra={"job_id": str(job.id), "correlation_id": job.correlation_id})
+    ids = {"job_id": str(job.id), "correlation_id": job.correlation_id, "job_type": job.job_type,
+           "retry_count": job.retry_count}
+    log.info("job claimed", extra=ids)
+    began = time.monotonic()
+    category: str | None = None  # why the attempt failed: permanent | transient | database | unexpected
     try:
         status = run_job(conn, job, data_dir, now_fn)
     except JobClaimLost:
         status = "SUPERSEDED"
     except PermanentJobError as e:
+        category = "permanent"
         status = _fail_or_retry(conn, job, False, str(e)[:500], now_fn(), rand)
     except TransientJobError as e:
+        category = "transient"
         status = _fail_or_retry(conn, job, True, str(e)[:500], now_fn(), rand)
     except (psycopg.OperationalError, psycopg.InterfaceError):
         # Database/network trouble: the transaction rolled back, the load is idempotent, so retry is safe.
+        category = "database"
         status = _fail_or_retry(conn, job, True, "transient database error", now_fn(), rand)
     except Exception as e:  # noqa: BLE001 - unknown bug: fail safely, never retry blindly, never leak details
-        log.exception("unexpected error", extra={"job_id": str(job.id)})
+        category = "unexpected"
+        log.exception("unexpected error", extra=ids)
         status = _fail_or_retry(conn, job, False, f"unexpected error ({type(e).__name__})", now_fn(), rand)
+    duration_ms = round((time.monotonic() - began) * 1000)
     if status == "SUPERSEDED":
-        log.info("job attempt superseded", extra={"job_id": str(job.id), "correlation_id": job.correlation_id})
+        log.info("job attempt superseded", extra={**ids, "duration_ms": duration_ms})
         return status
     if status in ("SUCCEEDED", "PARTIALLY_SUCCEEDED"):
         _cleanup_uploaded_file(job, data_dir)
-    log.info("job finished", extra={"job_id": str(job.id), "status": status, "correlation_id": job.correlation_id})
+    outcome = {**ids, "status": status, "duration_ms": duration_ms}
+    if category is not None:
+        outcome["error_category"] = category
+    log.log(logging.WARNING if category else logging.INFO, "job finished", extra=outcome)
     return status
 
 
@@ -333,21 +391,140 @@ def recover_stale(conn: psycopg.Connection, timeout: timedelta, now: datetime,
     return len(stale)
 
 
-def run_forever(dsn: str, data_dir: Path | None, poll_seconds: float = 2.0,
-                stale_after: timedelta = timedelta(minutes=15)) -> None:  # pragma: no cover - loop wrapper
-    import time
+HEARTBEAT_INTERVAL_SECONDS = 10
+HEARTBEAT_RETENTION = timedelta(days=7)
 
+
+def worker_identity() -> str:
+    """Stable per container/process host: the hostname (the container id under Docker)."""
+    return (os.environ.get("HOSTNAME") or socket.gethostname())[:100]
+
+
+def heartbeat(conn: psycopg.Connection, worker_id: str, started_at: datetime, now: datetime | None = None) -> None:
+    """Record that this worker is alive (the API publishes it as ``pidea_workers_alive``) and prune old rows."""
+    now = now or utcnow()
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO integration.worker_heartbeat (worker_id, started_at, last_seen) VALUES (%s,%s,%s)
+               ON CONFLICT (worker_id) DO UPDATE SET last_seen = EXCLUDED.last_seen, started_at = EXCLUDED.started_at""",
+            (worker_id, started_at, now),
+        )
+        cur.execute("DELETE FROM integration.worker_heartbeat WHERE last_seen < %s", (now - HEARTBEAT_RETENTION,))
+
+
+def try_heartbeat(conn: psycopg.Connection, worker_id: str, started_at: datetime) -> None:
+    """Best-effort heartbeat: monitoring must never stop the worker. Connection problems still propagate so the
+    main loop reconnects; any other database error (for example a missing grant) is logged and ignored."""
+    try:
+        heartbeat(conn, worker_id, started_at)
+    except psycopg.OperationalError:
+        raise
+    except psycopg.Error as exc:
+        log.warning("heartbeat failed; continuing without it", extra={"worker_id": worker_id,
+                                                                     "error_category": type(exc).__name__})
+
+
+PURGE_INTERVAL_SECONDS = 3600
+PURGE_BATCH = 5000
+DEFAULT_RAW_RETENTION = timedelta(days=30)
+_TERMINAL = ("SUCCEEDED", "PARTIALLY_SUCCEEDED", "FAILED", "CANCELLED")
+
+
+def purge_expired(conn: psycopg.Connection, now: datetime, raw_retention: timedelta | None,
+                  batch: int = PURGE_BATCH) -> dict[str, int]:
+    """Delete data that has outlived its purpose, in bounded batches so no long lock is ever held.
+
+    * ``idempotency_record`` rows past ``expires_at`` (the API only removes an expired key if that same key is
+      reused, so unreused keys would otherwise accumulate forever).
+    * ``raw_record`` payloads (the submitted customer data) of jobs that finished more than ``raw_retention``
+      ago. After that a FAILED RECORDS job can no longer be replayed (the API answers 409 for it).
+      ``None`` keeps payloads forever. Jobs, attempts, rejected-record diagnostics and audit events are kept.
+    """
+    removed = {"idempotency_records": 0, "raw_records": 0}
+    with conn.cursor() as cur:
+        for _ in range(100):  # hard cap: one purge pass never loops unboundedly
+            cur.execute(
+                """DELETE FROM integration.idempotency_record WHERE id IN
+                   (SELECT id FROM integration.idempotency_record WHERE expires_at < %s LIMIT %s)""",
+                (now, batch))
+            removed["idempotency_records"] += cur.rowcount
+            if cur.rowcount < batch:
+                break
+        if raw_retention is not None:
+            for _ in range(100):
+                cur.execute(
+                    """DELETE FROM integration.raw_record WHERE (job_id, seq) IN
+                       (SELECT r.job_id, r.seq FROM integration.raw_record r
+                        JOIN integration.ingestion_job j ON j.id = r.job_id
+                        WHERE j.status = ANY(%s) AND j.completed_at < %s LIMIT %s)""",
+                    (list(_TERMINAL), now - raw_retention, batch))
+                removed["raw_records"] += cur.rowcount
+                if cur.rowcount < batch:
+                    break
+    return removed
+
+
+def install_signal_handlers(stop: threading.Event) -> None:
+    """SIGTERM/SIGINT ask the loop to finish the job in hand and exit. Without a handler the worker (PID 1 in a
+    container) would ignore SIGTERM until ``docker stop`` kills it, stranding a running job for the stale timeout."""
+    def request_stop(signum, _frame):
+        log.info("shutdown requested; finishing the current job", extra={"worker_id": worker_identity()})
+        stop.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+
+def run_loop(dsn: str, data_dir: Path | None, stop: threading.Event, poll_seconds: float = 2.0,
+             stale_after: timedelta = timedelta(minutes=15),
+             raw_retention: timedelta | None = DEFAULT_RAW_RETENTION) -> None:
+    """The worker main loop. Returns after ``stop`` is set, once the job in progress has finished."""
+    worker_id = worker_identity()
+    started_at = utcnow()
+    log.info("worker starting", extra={"worker_id": worker_id})
     next_upload_cleanup = 0.0
-    while True:
+    next_heartbeat = 0.0
+    next_purge = 0.0
+    failures = 0
+    while not stop.is_set():
         try:
-            with psycopg.connect(dsn, autocommit=True) as conn:
-                while True:
+            with psycopg.connect(dsn, autocommit=True, connect_timeout=2) as conn:
+                failures = 0
+                while not stop.is_set():
+                    if time.monotonic() >= next_heartbeat:
+                        try_heartbeat(conn, worker_id, started_at)
+                        next_heartbeat = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
                     recover_stale(conn, stale_after, utcnow())
                     if time.monotonic() >= next_upload_cleanup:
                         cleanup_uploads(conn, data_dir)
                         next_upload_cleanup = time.monotonic() + 60
+                    if time.monotonic() >= next_purge:
+                        next_purge = time.monotonic() + PURGE_INTERVAL_SECONDS
+                        try:
+                            removed = purge_expired(conn, utcnow(), raw_retention)
+                            if any(removed.values()):
+                                log.info("expired data purged: %s", json.dumps(removed),
+                                         extra={"worker_id": worker_id})
+                        except psycopg.OperationalError:
+                            raise
+                        except psycopg.Error as exc:  # housekeeping must never stop job processing
+                            log.warning("purge failed; will retry next interval",
+                                        extra={"worker_id": worker_id, "error_category": type(exc).__name__})
                     if process_one(conn, data_dir) is None:
-                        time.sleep(poll_seconds)
+                        stop.wait(poll_seconds)
         except psycopg.OperationalError:
-            log.warning("database unavailable, retrying in 5s")
-            time.sleep(5)
+            failures += 1
+            delay = min(30, 2 ** min(failures, 5))  # 2s, 4s, ... capped at 30s
+            log.warning("database unavailable, retrying",
+                        extra={"worker_id": worker_id, "error_category": "database", "attempt": failures,
+                               "delay_seconds": delay})
+            stop.wait(delay)
+    log.info("worker stopped", extra={"worker_id": worker_id})
+
+
+def run_forever(dsn: str, data_dir: Path | None, poll_seconds: float = 2.0,
+                stale_after: timedelta = timedelta(minutes=15),
+                raw_retention: timedelta | None = DEFAULT_RAW_RETENTION) -> None:  # pragma: no cover - entry point
+    stop = threading.Event()
+    install_signal_handlers(stop)
+    run_loop(dsn, data_dir, stop, poll_seconds, stale_after, raw_retention)

@@ -5,6 +5,15 @@ spring:
     url: ${PIDEA_DB_URL:jdbc:postgresql://localhost:5432/pidea}
     username: ${PIDEA_DB_USER:pidea_app}
     password: ${PIDEA_DB_PASSWORD}   # no default on purpose: must come from the environment
+    hikari:
+      # Wait (bounded) for the database at startup instead of failing on the first refused connection.
+      initialization-fail-timeout: ${PIDEA_DB_STARTUP_TIMEOUT_MS:30000}
+      connection-timeout: 10000
+      # Explicit so capacity is a decision, not a default: the API needs few connections (REST calls, the schedule
+      # runner and the metrics refresh). Raise PIDEA_DB_POOL_SIZE only together with the database max_connections.
+      maximum-pool-size: ${PIDEA_DB_POOL_SIZE:10}
+      minimum-idle: 2
+      max-lifetime: 1800000
   jpa:
     open-in-view: false
     hibernate:
@@ -17,6 +26,9 @@ spring:
     password: ${PIDEA_FLYWAY_PASSWORD:${PIDEA_DB_PASSWORD}}
     schemas: integration,analytics
     default-schema: integration
+    # Bounded retry (10 attempts, 5s apart) if the database is still starting; then fail with the real error.
+    connect-retries: 10
+    connect-retries-interval: 5s
   servlet:
     multipart:
       max-file-size: 5MB
@@ -29,6 +41,8 @@ server:
   tomcat:
     max-swallow-size: 6MB
 pidea:
+  metrics:
+    refresh-interval-ms: 15000
   ingestion:
     upload-dir: ${PIDEA_UPLOAD_DIR:./local-data/uploads}
   security:
@@ -42,9 +56,20 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       probes:
         enabled: true
       show-details: never
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true   # latency histograms for the Grafana dashboard
+    tags:
+      application: pidea-api
+logging:
+  # Every API log line carries the request's correlation id (set by CorrelationIdFilter, echoed in X-Correlation-Id
+  # and stored on jobs/audit events). Set LOGGING_STRUCTURED_FORMAT_CONSOLE=logstash for JSON logs.
+  pattern:
+    level: "%5p [%X{correlationId:-}]"

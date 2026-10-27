@@ -1,0 +1,14 @@
+# Accepted findings. Each entry needs a reason and an expiry so it is re-reviewed, not forgotten.
+# Syntax: https://trivy.dev/docs/latest/configuration/filtering/#trivyignoreyaml
+vulnerabilities:
+  - id: CVE-2026-47884
+    statement: >-
+      spring-webmvc XsltView SSRF/RCE. No fix exists in the 6.2.x line (fixed only in 7.0.9). Not reachable: the API
+      has no view layer, no XsltView and no template engine (REST controllers returning JSON only; verified by grep).
+      Revisit when Spring Boot 4 migration or a 6.2.x backport is available.
+    expired_at: 2026-12-31
+  - id: CVE-2026-47890
+    statement: >-
+      spring-webmvc SSE stream corruption with view fragments. No fix in 6.2.x. Not reachable: no SseEmitter,
+      text/event-stream or view fragments are used (verified by grep). Revisit with the Boot 4 migration.
+    expired_at: 2026-12-31

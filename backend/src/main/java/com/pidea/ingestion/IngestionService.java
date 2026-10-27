@@ -121,6 +121,14 @@ public class IngestionService {
             throw new ConflictException("The uploaded file is no longer available for replay");
         }
 
+        if ("RECORDS".equals(original.jobType()) && original.recordsReceived() > 0
+                && jdbc.queryForObject("SELECT count(*) FROM integration.raw_record WHERE job_id = ?",
+                    Long.class, id) == 0) {
+            // The worker purges submitted payloads after PIDEA_RAW_RETENTION_DAYS. Replaying without input would
+            // create a job whose counters can never reconcile, so refuse it with a clear reason instead.
+            throw new ConflictException("The original input is no longer retained, so this job cannot be replayed");
+        }
+
         UUID replayId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now(clock));
         jdbc.update("""
@@ -220,10 +228,11 @@ public class IngestionService {
         if (source.status() != SourceStatus.ACTIVE) {
             throw new ConflictException("Integration source is disabled");
         }
-        if (source.type() != SourceType.HTTP_API) {
-            throw new ConflictException("Only HTTP_API sources can be triggered");
+        if (source.type() != SourceType.HTTP_API && source.type() != SourceType.POSTGRES_TABLE) {
+            throw new ConflictException("Only HTTP_API and POSTGRES_TABLE sources can be triggered");
         }
 
+        JobType pullType = source.type() == SourceType.POSTGRES_TABLE ? JobType.POSTGRES_PULL : JobType.HTTP_PULL;
         Instant now = Instant.now(clock);
         String fingerprint = fingerprint(sourceId + ":" + entityType.name() + ":" + source.version());
         Submission replay = claimIdempotency(principal, idempotencyKey, fingerprint, now);
@@ -235,11 +244,11 @@ public class IngestionService {
             INSERT INTO integration.ingestion_job
               (id, source_id, job_type, entity_type, status, correlation_id, records_received,
                next_attempt_at, submitted_at, submitted_by)
-            VALUES (?, ?, 'HTTP_PULL', ?, 'PENDING', ?, 0, ?, ?, ?)""",
-            jobId, sourceId, entityType.name(), correlationId(), ts, ts, principal);
+            VALUES (?, ?, ?, ?, 'PENDING', ?, 0, ?, ?, ?)""",
+            jobId, sourceId, pullType.name(), entityType.name(), correlationId(), ts, ts, principal);
         jdbc.update("UPDATE integration.idempotency_record SET job_id = ? WHERE scope = ? AND idempotency_key = ?",
             jobId, principal, idempotencyKey);
-        audit.record("HTTP_PULL_SUBMITTED", "INGESTION_JOB", jobId,
+        audit.record(pullType + "_SUBMITTED", "INGESTION_JOB", jobId,
             Map.of("sourceId", sourceId, "entityType", entityType));
         return new Submission(getJob(jobId), false);
     }
@@ -386,6 +395,63 @@ public class IngestionService {
             jobId, pr.getPageSize(), pr.getOffset());
         long t = total == null ? 0 : total;
         return new PageResponse<>(items, pr.getPageNumber(), pr.getPageSize(), t, (int) Math.ceil(t / (double) pr.getPageSize()));
+    }
+
+    private static final java.util.regex.Pattern REASON_CODE = java.util.regex.Pattern.compile("^[A-Z][A-Z0-9_]{0,49}$");
+
+    /**
+     * Quarantined records across jobs, newest first. Filters are all optional and combined with AND. Only reason
+     * codes and safe diagnostics are returned (the table never holds the raw payload).
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<QuarantinedRecordResponse> quarantine(UUID sourceId, UUID jobId, EntityType entityType,
+                                                              String reasonCode, Instant processedFrom,
+                                                              Instant processedTo, int page, int size) {
+        if (reasonCode != null && !REASON_CODE.matcher(reasonCode).matches()) {
+            throw new ValidationException("reasonCode must be an UPPER_SNAKE_CASE code");
+        }
+        if (processedFrom != null && processedTo != null && processedFrom.isAfter(processedTo)) {
+            throw new ValidationException("processedFrom must not be after processedTo");
+        }
+        var pr = PageResponse.pageRequest(page, size, org.springframework.data.domain.Sort.unsorted());
+        List<Object> args = new ArrayList<>();
+        StringBuilder where = new StringBuilder(" WHERE 1=1");
+        if (sourceId != null) { where.append(" AND source_id = ?"); args.add(sourceId); }
+        if (jobId != null) { where.append(" AND job_id = ?"); args.add(jobId); }
+        if (entityType != null) { where.append(" AND entity_type = ?"); args.add(entityType.name()); }
+        if (reasonCode != null) { where.append(" AND reason_code = ?"); args.add(reasonCode); }
+        if (processedFrom != null) { where.append(" AND processed_at >= ?"); args.add(Timestamp.from(processedFrom)); }
+        if (processedTo != null) { where.append(" AND processed_at <= ?"); args.add(Timestamp.from(processedTo)); }
+        Long total = jdbc.queryForObject("SELECT count(*) FROM integration.rejected_record" + where, Long.class,
+            args.toArray());
+        args.add(pr.getPageSize());
+        args.add(pr.getOffset());
+        List<QuarantinedRecordResponse> items = jdbc.query("""
+            SELECT id, job_id, source_id, entity_type, source_record_ref, reason_code, details, processed_at
+            FROM integration.rejected_record""" + where + " ORDER BY processed_at DESC, id LIMIT ? OFFSET ?",
+            (rs, n) -> new QuarantinedRecordResponse(rs.getObject("id", UUID.class),
+                rs.getObject("job_id", UUID.class), rs.getObject("source_id", UUID.class),
+                rs.getString("entity_type"), rs.getString("source_record_ref"), rs.getString("reason_code"),
+                rs.getString("details"), rs.getTimestamp("processed_at").toInstant()),
+            args.toArray());
+        long t = total == null ? 0 : total;
+        return new PageResponse<>(items, pr.getPageNumber(), pr.getPageSize(), t,
+            (int) Math.ceil(t / (double) pr.getPageSize()));
+    }
+
+    /** Distinct reason codes with counts, for building filters. */
+    @Transactional(readOnly = true)
+    public List<ReasonCount> quarantineReasons(UUID sourceId) {
+        if (sourceId == null) {
+            return jdbc.query("""
+                SELECT reason_code, count(*) FROM integration.rejected_record
+                GROUP BY reason_code ORDER BY count(*) DESC, reason_code""",
+                (rs, n) -> new ReasonCount(rs.getString(1), rs.getLong(2)));
+        }
+        return jdbc.query("""
+            SELECT reason_code, count(*) FROM integration.rejected_record WHERE source_id = ?
+            GROUP BY reason_code ORDER BY count(*) DESC, reason_code""",
+            (rs, n) -> new ReasonCount(rs.getString(1), rs.getLong(2)), sourceId);
     }
 
     /** Atomic: only a job that has not started (or is waiting for retry) can be cancelled. */

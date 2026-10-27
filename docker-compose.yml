@@ -2,7 +2,8 @@
 # Requires a .env file (copy .env.example). No AWS credentials needed.
 services:
   db:
-    image: postgres:16-alpine
+    restart: unless-stopped
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pidea}
       POSTGRES_USER: ${POSTGRES_USER:-pidea_owner}
@@ -15,12 +16,15 @@ services:
       - pidea-db:/var/lib/postgresql/data
       - ./docker/db-init.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
     healthcheck:                   # "container running" != "database ready"
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # -h forces a TCP check: during first-time init the entrypoint runs a temporary server that only
+      # listens on the unix socket, so a socket-only pg_isready can pass before clients can connect.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   api:
+    restart: unless-stopped
     build: ./backend
     depends_on:
       db: { condition: service_healthy }
@@ -35,6 +39,8 @@ services:
       PIDEA_VIEWER_PASSWORD_HASH: ${PIDEA_VIEWER_PASSWORD_HASH:-}
       PIDEA_UPLOAD_DIR: /var/lib/pidea/uploads
       JAVA_TOOL_OPTIONS: -Xmx384m
+      # JSON log lines (with the request correlation id); set PIDEA_API_LOG_FORMAT=text for plain text
+      LOGGING_STRUCTURED_FORMAT_CONSOLE: ${PIDEA_API_LOG_FORMAT:-logstash}
     ports:
       - "127.0.0.1:${PIDEA_API_PORT:-8080}:8080"
     volumes:
@@ -49,6 +55,8 @@ services:
     stop_grace_period: 30s
 
   worker:
+    restart: unless-stopped
+    stop_grace_period: 60s   # SIGTERM lets the worker finish the job in hand; SIGKILL only after this
     build: ./data-engine
     depends_on:
       api: { condition: service_healthy }   # the API applies the Flyway migrations first
@@ -57,10 +65,84 @@ services:
       PIDEA_DATA_DIR: /uploads
       PIDEA_HTTP_API_ALLOWED_HOSTS: ${PIDEA_HTTP_API_ALLOWED_HOSTS:-}
       PIDEA_HTTP_API_BEARER_TOKEN: ${PIDEA_HTTP_API_BEARER_TOKEN:-}
+      # POSTGRES_TABLE sources: exact host:port allow-list (deny by default) and the password variables that
+      # sources reference through secretRef. Variable names must start with PIDEA_SRC_; add one per source.
+      PIDEA_PG_SOURCE_ALLOWED_HOSTS: ${PIDEA_PG_SOURCE_ALLOWED_HOSTS:-}
+      # Days to keep submitted raw payloads after a job finishes (0 = forever). Failed RECORDS jobs cannot be replayed afterwards.
+      PIDEA_RAW_RETENTION_DAYS: ${PIDEA_RAW_RETENTION_DAYS:-30}
+      PIDEA_SRC_DEMO_PASSWORD: ${PIDEA_DEMO_SOURCE_PASSWORD:-}
     volumes:
       - pidea-uploads:/uploads
     mem_limit: 256m
 
+  # Optional local demo source for the POSTGRES_TABLE connector (synthetic data, SELECT-only role, no published
+  # port). Start with:  docker compose --profile demo up -d demo-source
+  # Needs PIDEA_DEMO_SOURCE_PASSWORD in .env and PIDEA_PG_SOURCE_ALLOWED_HOSTS=demo-source:5432 for the worker.
+  demo-source:
+    profiles: ["demo"]
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: demo_owner
+      POSTGRES_PASSWORD: ${PIDEA_DEMO_SOURCE_PASSWORD:-}
+    volumes:
+      - ./docker/demo-source-init.sh:/docker-entrypoint-initdb.d/01-seed.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U demo_owner -d crm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Optional monitoring (profile "observability"): docker compose --profile observability up -d
+  # Prometheus (127.0.0.1:9090) scrapes the API as the read-only "viewer" user; Grafana (127.0.0.1:3000) shows the
+  # provisioned "PIDEA overview" dashboard. Both are loopback-only and nothing in the core stack depends on them.
+  # Needs PIDEA_METRICS_PASSWORD (the viewer account's password) and GRAFANA_ADMIN_PASSWORD in .env.
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    depends_on:
+      api: { condition: service_healthy }
+    secrets: [pidea_metrics_password]
+    volumes:
+      - ./docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PIDEA_PROMETHEUS_PORT:-9090}:9090"
+    mem_limit: 512m
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    depends_on:
+      - prometheus
+    secrets: [grafana_admin_password]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${PIDEA_GRAFANA_PORT:-3000}:3000"
+    mem_limit: 384m
+
 volumes:
   pidea-db:
   pidea-uploads:
+  prometheus-data:
+  grafana-data:
+
+# Only read by the optional "observability" profile.
+secrets:
+  pidea_metrics_password:
+    environment: PIDEA_METRICS_PASSWORD
+  grafana_admin_password:
+    environment: GRAFANA_ADMIN_PASSWORD
