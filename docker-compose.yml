@@ -3,7 +3,7 @@
 services:
   db:
     restart: unless-stopped
-    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pidea}
       POSTGRES_USER: ${POSTGRES_USER:-pidea_owner}
@@ -80,7 +80,7 @@ services:
   # Needs PIDEA_DEMO_SOURCE_PASSWORD in .env and PIDEA_PG_SOURCE_ALLOWED_HOSTS=demo-source:5432 for the worker.
   demo-source:
     profiles: ["demo"]
-    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     environment:
       POSTGRES_DB: crm
       POSTGRES_USER: demo_owner
